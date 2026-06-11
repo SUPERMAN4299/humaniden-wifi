@@ -30,21 +30,72 @@ class WiFiHumanDetector:
         self.human_detected = False
         
     def get_wifi_networks_linux(self):
-        """Scan WiFi networks on Linux"""
+        """Scan WiFi networks on Linux using nmcli terse mode for reliable parsing"""
+        networks = {}
+
+        # Strategy 1: nmcli terse mode — outputs "SSID:SIGNAL" with no graphical chars
         try:
-            result = subprocess.run(['nmcli', 'dev', 'wifi', 'list'], 
-                                  capture_output=True, text=True)
-            networks = {}
-            for line in result.stdout.split('\n')[1:]:
-                parts = re.split(r'\s{2,}', line.strip())
-                if len(parts) >= 8:
-                    ssid = parts[1]
-                    signal = int(parts[6])
+            result = subprocess.run(
+                ['nmcli', '--terse', '--fields', 'SSID,SIGNAL', 'dev', 'wifi', 'list'],
+                capture_output=True, text=True
+            )
+            for line in result.stdout.strip().split('\n'):
+                if ':' in line:
+                    # Split only on the LAST colon so SSIDs containing ':' are kept intact
+                    *ssid_parts, signal_str = line.split(':')
+                    ssid = ':'.join(ssid_parts).strip()
+                    if ssid and signal_str.strip().isdigit():
+                        # nmcli SIGNAL is 0–100 percentage; convert to approximate dBm
+                        pct = int(signal_str.strip())
+                        dbm = int(-100 + pct * 0.7)
+                        networks[ssid] = dbm
+            if networks:
+                return networks
+        except Exception:
+            pass
+
+        # Strategy 2: read RSSI directly from /proc/net/wireless (no external tools needed)
+        try:
+            with open('/proc/net/wireless', 'r') as f:
+                lines = f.readlines()
+            for line in lines[2:]:          # first 2 lines are headers
+                parts = line.split()
+                if len(parts) >= 4:
+                    iface = parts[0].rstrip(':')
+                    # column index 3 is "Signal level" in dBm (may have a trailing dot)
+                    signal_str = parts[3].rstrip('.')
+                    try:
+                        signal = int(float(signal_str))
+                        # /proc/net/wireless doesn't give SSID; use interface name as key
+                        networks[iface] = signal
+                    except ValueError:
+                        continue
+            if networks:
+                return networks
+        except Exception:
+            pass
+
+        # Strategy 3: iwconfig fallback
+        try:
+            result = subprocess.run(['iwconfig'], capture_output=True, text=True)
+            ssid, signal = None, None
+            for line in result.stdout.split('\n'):
+                m = re.search(r'ESSID:"([^"]+)"', line)
+                if m:
+                    ssid = m.group(1)
+                m = re.search(r'Signal level=(-?\d+)', line)
+                if m:
+                    signal = int(m.group(1))
+                if ssid and signal is not None:
                     networks[ssid] = signal
-            return networks
-        except Exception as e:
-            print(f"Error scanning networks on Linux: {e}")
-            return {}
+                    ssid, signal = None, None
+            if networks:
+                return networks
+        except Exception:
+            pass
+
+        print("Could not read WiFi signal. Make sure WiFi is on and nmcli/iwconfig is installed.")
+        return {}
     
     def get_wifi_networks_windows(self):
         """Scan WiFi networks on Windows"""
@@ -188,7 +239,7 @@ class WiFiHumanDetector:
 if __name__ == "__main__":
     # Create detector instance
     # You can specify a WiFi network name, or leave None to use strongest signal
-    detector = WiFiHumanDetector(ssid=None, window_size=20, threshold=5)
+    detector = WiFiHumanDetector(ssid="Airtel_kund_4480", window_size=20, threshold=5)
     
     # Start monitoring for 120 seconds, checking every 2 seconds
     detector.monitor(interval=2, duration=120)
